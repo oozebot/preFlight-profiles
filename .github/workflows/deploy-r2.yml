@@ -1,0 +1,61 @@
+name: Deploy to Cloudflare R2
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Install wrangler
+        run: npm install -g wrangler
+
+      - name: Sync profiles to R2
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          BEFORE="${{ github.event.before }}"
+          PROFILE_EXTS="\.ini$|\.json$|\.png$|\.svg$|\.stl$"
+          failed=0
+
+          if [ "$BEFORE" = "0000000000000000000000000000000000000000" ] || ! git cat-file -e "$BEFORE" 2>/dev/null; then
+            echo "Full upload (initial or force push)"
+            find . -type f | grep -E "$PROFILE_EXTS" | sed 's|^\./||' > /tmp/upload_files.txt
+          else
+            echo "Incremental upload (diff against previous)"
+            git diff --name-only --diff-filter=ACM "$BEFORE" HEAD | grep -E "$PROFILE_EXTS" > /tmp/upload_files.txt || true
+
+            # Delete removed files from R2
+            git diff --name-only --diff-filter=D "$BEFORE" HEAD | grep -E "$PROFILE_EXTS" | while IFS= read -r key; do
+              echo "Deleting: $key"
+              wrangler r2 object delete "preflight-profiles/$key" --remote 2>&1 || echo "Delete failed: $key"
+            done
+          fi
+
+          # Upload new/changed files
+          while IFS= read -r key; do
+            success=false
+            for attempt in 1 2 3; do
+              if wrangler r2 object put "preflight-profiles/$key" --file="$key" --content-type="$(file --mime-type -b "$key")" --remote 2>&1; then
+                success=true
+                break
+              fi
+              echo "Retry $attempt for $key..."
+              sleep 2
+            done
+            if [ "$success" = false ]; then
+              echo "FAILED: $key"
+              failed=$((failed + 1))
+            fi
+          done < /tmp/upload_files.txt
+
+          if [ "$failed" -gt 0 ]; then
+            echo "$failed files failed to upload"
+            exit 1
+          fi
